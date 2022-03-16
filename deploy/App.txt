@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cumulative Flow by Tags</title>
+    <!--  (c) 2014 Rally Software Development Corp.  All Rights Reserved. -->
+    <!--  Build Date: Fri Dec 12 2014 19:53:58 GMT-0700 (MST) -->
+    
+    <script type="text/javascript">
+        var APP_BUILD_DATE = "Fri Dec 12 2014 19:53:58 GMT-0700 (MST)";
+        var CHECKSUM = 46606466518;
+    </script>
+    
+    <script type="text/javascript" src="/apps/2.0rc3/sdk.js"></script>
+
+    <script type="text/javascript">
+        Rally.onReady(function() {
+             
+Ext.define("CumulativeFlowCalculator", {
+     extend: "Rally.data.lookback.calculator.TimeSeriesCalculator",
+     config: {
+         stateFieldName: 'ScheduleState',
+         stateFieldValues: ['Defined', 'In-Progress', 'Completed', 'Accepted', 'Finished'],
+         lowestLevelPortfolioItemType: '',
+         portfolioItemStateDone: '',
+         portfolioItemStateName: '',
+         preliminaryEstimateMap: []
+     },
+     InProgressName: 'In-Progress',
+     AcceptedName: 'Accepted',
+     actualPoints: 0,
+     actualIndex: 0,
+     totalPoints: 0,
+     gridStoreData: null,
+     
+     constructor: function(config) {
+         this.initConfig(config);
+         this.callParent(arguments);
+     },
+     runCalculation: function (snapshots) {
+         var calculatorConfig = this._prepareCalculatorConfig(),
+             seriesConfig = this._buildSeriesConfig(calculatorConfig);
+
+         var calculator = this.prepareCalculator(calculatorConfig);
+         calculator.addSnapshots(snapshots, this._getStartDate(snapshots), this._getEndDate(snapshots));
+         
+         this.gridStoreData = this._buildGridStore(snapshots);
+         
+         var calcs = this._transformLumenizeDataToHighchartsSeries(calculator, seriesConfig);
+
+         var total_series = this.getSeriesByName('TotalEstimated',calcs);
+         this.totalPoints = total_series.data[calcs.categories.length-1];
+         total_series.stack = 'total';
+         total_series.zIndex = 0;
+         total_series.color = '#CCCCCC';                 
+
+         
+         var actual_series = this._getActualSeries(calcs);
+         calcs.series.push(actual_series);
+        
+         var ideal_series = this._getIdealSeries(calcs);
+         calcs.series.push(ideal_series);
+         
+         var remaining_series = this._getRemainingSeries(calcs);
+         if (remaining_series){
+             calcs.series.push(remaining_series);
+         }
+         
+         //Format the categories by week 
+         var new_categories = _.map(calcs.categories, function(c){
+             var week = Rally.util.DateTime.format(new Date(c), 'W');
+             var year = Rally.util.DateTime.format(new Date(c),'Y');
+             return 'WW' + week.toString(); 
+         });
+         calcs.categories = new_categories;
+         
+         var remove_series = ['DerivedLeafStoryPlanEstimateTotal','DerivedPreliminaryEstimate','PlanEstimate'];
+         for (var i = calcs.series.length-1; i >= 0; i--){
+             if (calcs.series[i].name != 'TotalEstimated'){
+                 calcs.series[i].zIndex = 1; 
+             } 
+             if (Ext.Array.contains(remove_series,calcs.series[i].name)){
+                 calcs.series.splice(i,1);
+             }
+         }
+        // console.log('calcs',calcs);
+         return calcs;
+     },
+     getPercentCompleted: function(){
+         if (this.totalPoints > 0){
+             return Ext.String.format("{0} % of {1} total points completed", (this.actualPoints / this.totalPoints * 100).toFixed(1), this.totalPoints);
+         }
+         return 'No total points to calculate % Completed';
+     },
+     _getRemainingSeries: function(calcs){
+
+         var velocity = 0;
+         var actual_index = Number(this.actualIndex);
+         if (actual_index == 0 && actual_index == 0 ||
+                 actual_index == calcs.categories.length-1){
+             return null; 
+         }
+         var data = [];
+         for (var i=0; i< calcs.categories.length; i++){
+             data[i] = null;
+        }
+         
+        data[actual_index] = this.actualPoints;
+        data[calcs.categories.length-1] = this.totalPoints;
+        var delta_points = data[calcs.categories.length-1] - data[actual_index];
+
+        //calculate velocity and slope of the line
+        var endDate = Rally.util.DateTime.fromIsoString(calcs.categories[calcs.categories.length-1]);
+        var startDate = Rally.util.DateTime.fromIsoString(calcs.categories[actual_index]);
+        var delta_days = calcs.categories.length-1 - actual_index;   //Rally.util.DateTime.getDifference(new Date(endDate),new Date(startDate),'day');
+        var delta_weeks = Rally.util.DateTime.getDifference(endDate,startDate, 'week');
+
+        var slope = delta_points/delta_days;  
+        var velocity = Math.round(delta_points/delta_weeks);
+
+        if (slope == 0){
+            return null; 
+        }
+        
+        var points = [];
+        for (var i = actual_index; i > 0; i--){
+            y = this.actualPoints - slope*(actual_index - i);
+            if (y > 0){
+                points.push({x: i, y: y});
+            }
+        }
+        if (points.length == 0){
+            return null; 
+        }
+        
+        var slope_index = Math.round(points.length * .33);
+        data[points[slope_index].x] = points[slope_index].y;
+        
+         var series = {
+                 name: Ext.String.format('Remaining (velocity: {0})',velocity),
+                 type: 'line',
+                 data: data,
+                 color: '#00CCFF',
+                 dashStyle: 'Solid',
+                 stack: 'remaining'
+         };
+         return series;
+     },
+     _getIdealSeries: function(calcs){
+         var data = [];
+         var endDate = new Date(this.getEndDate());
+         var startDate = new Date(this.getStartDate());
+         var totalPoints = Number(this.totalPoints);
+         var num_velocity_periods = Rally.util.DateTime.getDifference(endDate, startDate,'week')/2;
+         var velocity = 0;
+         var data = [];
+         var startDatei = 0;
+
+         var endDatei = calcs.categories.length-1;  
+         
+         for(var i=0; i< calcs.categories.length; i++){
+            var d = new Date(calcs.categories[i]);
+            data[i] = null; 
+            if (d.getYear() == startDate.getYear() && 
+                 d.getMonth() == startDate.getMonth() && 
+                 d.getDate() == startDate.getDate()){
+                startDatei = i;
+            }
+            if (d.getYear() == endDate.getYear() && 
+                    d.getMonth() == endDate.getMonth() && 
+                    d.getDate() == endDate.getDate()){
+                endDatei = i;   
+               }
+         };
+         velocity = Math.round(totalPoints/num_velocity_periods);  
+         data[startDatei] = 0;
+         data[endDatei] = totalPoints;
+         var series = {
+                 name: Ext.String.format('Ideal (velocity: {0})',velocity),
+                 type: 'line',
+                 data: data,
+                 color: '#00FF00',
+                 dashStyle: 'Solid',
+                 stack: 'ideal'
+         };
+         return series;
+     },
+     _getActualSeries: function(calcs){
+
+         var data = []; 
+         var num_velocity_periods = Rally.util.DateTime.getDifference(new Date(calcs.categories[calcs.categories.length-1]), new Date(calcs.categories[0]),'week')/2;
+         var velocity = 0;
+         var states = this.getStateFieldValues(); 
+
+         this.actualPoints = 0 ;
+         this.actualIndex = 0; 
+         var currentDate = new Date();
+
+         for(var i=0; i< calcs.categories.length; i++){
+             var d = new Date(calcs.categories[i]);
+             data[i] = null; 
+
+             if (d.getYear() >= currentDate.getYear() && 
+                  d.getMonth() >= currentDate.getMonth() && 
+                  d.getDate() >= currentDate.getDate()){
+                 this.actualIndex = i;
+                 break; 
+             }
+          };
+
+          if (this.actualIndex == 0){
+              this.actualIndex = calcs.categories.length-1;
+          }
+
+         var in_progress_idx = Ext.Array.indexOf(states, this.InProgressName, 0); 
+         var firstInProgressi = calcs.categories.length + 1;
+         Ext.each(calcs.series, function(s){
+             var current_state_idx = Ext.Array.indexOf(states, s.name, 0);
+             if (current_state_idx >= in_progress_idx){
+                 for (var i=0; i<s.data.length; i++){
+                     if (s.data[i] > 0 && i < firstInProgressi){
+                         firstInProgressi = i;
+                         i = s.data.length; 
+                     }
+                 }
+             }
+             
+             if (s.name == this.AcceptedName){
+//                 _.range(s.data.length).map(function () { return null });
+                 for (var i=0; i<s.data.length; i++){
+                     data[i] = null;
+                 }
+                 this.actualPoints = s.data[this.actualIndex];
+             }
+         }, this);
+         
+         data[firstInProgressi] = 0;
+         data[this.actualIndex] = this.actualPoints; 
+         velocity = Math.round(this.actualPoints/num_velocity_periods);  
+         
+         var series = {
+                 name: Ext.String.format('Actual (velocity: {0})',velocity),
+                 type: 'line',
+                 data: data,
+                 color: '#000000',
+                 dashStyle: 'Solid',
+                 stack: 'actual'
+         };
+         return series;
+     },
+     getMetrics: function() {
+         var metrics = [];
+         Ext.each(this.getStateFieldValues(), function(stateFieldValue){
+             metrics.push({
+                 field: 'PlanEstimate',
+                 as: stateFieldValue,
+                 f: 'filteredSum',
+                 filterField: this.getStateFieldName(),
+                 filterValues: [stateFieldValue],
+                 display: 'area',
+             });  
+         }, this);
+         
+         metrics.push({
+             field: 'DerivedLeafStoryPlanEstimateTotal',
+             as: 'DerivedLeafStoryPlanEstimateTotal',
+             f: 'sum',
+         });
+
+         metrics.push({
+             field: 'DerivedPreliminaryEstimate',
+             as: 'DerivedPreliminaryEstimate',
+             f: 'sum',
+         });
+
+         metrics.push({
+             field: 'PlanEstimate',
+             as: 'PlanEstimate',
+             f: 'sum'
+         });
+
+         return metrics; 
+         
+     },
+       getDerivedFieldsOnInput: function(){
+           return [{
+               f: this.getDerivedPreliminaryEstimate,
+               as: 'DerivedPreliminaryEstimate',
+               preliminaryEstimateMap: this.preliminaryEstimateMap
+            },{
+                f: this.getDerivedLeafStoryPlanEstimateTotal,
+                as: 'DerivedLeafStoryPlanEstimateTotal'
+             }];
+    },
+    getDerivedLeafStoryPlanEstimateTotal: function(snapshot){
+        if (snapshot.LeafStoryPlanEstimateTotal){
+            return Number(snapshot.LeafStoryPlanEstimateTotal);
+        }
+        return 0; 
+    },
+     getDerivedFieldsAfterSummary: function(){
+         return [{
+             f: this.getTotalEstimated,
+             as: 'TotalEstimated',
+             display: 'area',
+             color: 'gray',
+          }];
+     },
+     getDerivedPreliminaryEstimate: function(snapshot){
+         if (snapshot.PreliminaryEstimate){
+             return Number(this.preliminaryEstimateMap[snapshot.PreliminaryEstimate]);
+         }
+         return 0;
+     },
+     getTotalEstimated: function(snapshot,index,metrics,seriesData){
+         return Ext.Array.max([seriesData[index].DerivedPreliminaryEstimate,seriesData[index].DerivedLeafStoryPlanEstimateTotal,seriesData[index].PlanEstimate]);
+     },
+     calcTotalPoints: function(calcs){
+         Ext.each(calcs.series, function(s){
+             if (s.name == 'TotalEstimated'){
+                 return Number(s.data[calcs.categories.length-1]);
+             }
+         },this);
+     },
+     getSeriesByName: function(seriesName, calcs){
+         var series = null; 
+         Ext.each(calcs.series, function(s){
+             var re = new RegExp(seriesName,"i");
+             if (re.test(s.name)){
+                 series = s;  
+             }
+         });
+         return series; 
+     },
+     _getPortfolioItemAncestorOid: function(snap, pids){
+         if (snap.PortfolioItem) {
+             return snap.PortfolioItem;  
+         }
+         for (var i=snap._ItemHierarchy.length; i > 0; i--){
+             if (Ext.Array.contains(pids, snap._ItemHierarchy[i])){
+                 return snap._ItemHierarchy[i];
+             }
+         }
+     },
+     _buildGridStore: function(snapshots){
+
+         var data_hash = {};  
+         var pids = [];  
+         Ext.each(snapshots, function(snap){
+             var type = snap._TypeHierarchy.slice(-1)[0];  
+             if (/^PortfolioItem/.test(type) && !Ext.Array.contains(pids, snap.ObjectID)){
+                 pids.push(snap.ObjectID);
+             }
+         },this);
+         
+         Ext.each(snapshots, function(snap){
+             if (/^9999/.test(snap._ValidTo)){
+                   var obj_id = snap.ObjectID;
+                   var type = snap._TypeHierarchy.slice(-1)[0];  
+                   var rec = { 
+                             "ObjectID": snap.ObjectID,
+                             "FormattedID":snap.FormattedID,
+                             "Name": snap.Name,
+                             "PlanEstimate": '',
+                             "AcceptedPlanEstimate": '',
+                             "parent": '',
+                             "State": '',
+                             "PreliminaryEstimate": ''
+                   };
+                     if (snap.PlanEstimate){
+                         rec['PlanEstimate'] = snap.PlanEstimate;
+                     }
+                     if (snap.LeafStoryPlanEstimateTotal){
+                         rec['PlanEstimate'] = snap.LeafStoryPlanEstimateTotal;
+                     }
+                     if (snap.AcceptedLeafStoryPlanEstimateTotal){
+                         rec['AcceptedPlanEstimate'] = snap.AcceptedLeafStoryPlanEstimateTotal;
+                     }
+                     if (type == 'HierarchicalRequirement'){
+                         rec['parent'] = this._getPortfolioItemAncestorOid(snap,pids);
+                     }
+                     if (snap.State){
+                         rec['State'] = snap.State;
+                     }
+                     if (snap.ScheduleState){
+                         rec['State'] = snap.ScheduleState;
+                         if (snap.ScheduleState == this.AcceptedName){
+                             rec['AcceptedPlanEstimate'] = snap.PlanEstimate; 
+                         }
+                     }
+                    if (snap.PreliminaryEstimate){
+                         rec['PreliminaryEstimate'] = this.preliminaryEstimateMap[snap.PreliminaryEstimate];
+                     }
+                     data_hash[obj_id] = rec;
+             }
+         },this);
+         return {data: data_hash}; 
+     }
+ });
+/**
+ * A link that pops up a version dialog box
+ */
+
+Ext.define('Rally.technicalservices.InfoLink',{
+    extend: 'Ext.Component',
+    alias: 'widget.tsinfolink',
+    
+    /**
+     * @cfg {String} informationHtml
+     * Additional text to be displayed on the popup dialog (for exmaple,
+     * to add a description of the app's use or functionality)
+     */
+    informationHtml: null,
+    
+    /**
+     * 
+     * cfg {String} title
+     * The title for the dialog box
+     */
+     title: "Build Information",
+    
+    renderTpl: "<div id='{id}-infolinkWrap' class='tsinfolink'>i</div>",
+
+    initComponent: function() {
+        this.callParent(arguments);
+       
+    },
+    
+    onRender: function() {
+        this.callParent(arguments);
+        this.mon(this.el,'click',this.onClick,this);
+    },
+    _generateChecksum: function(string){
+        var chk = 0x12345678,
+            i;
+        string = string.replace(/var CHECKSUM = .*;/,"");
+        string = string.replace(/\s/g,"");  //Remove all whitespace from the string.
+        
+        for (i = 0; i < string.length; i++) {
+            chk += (string.charCodeAt(i) * i);
+        }
+    
+        return chk;
+    },
+    _checkChecksum: function(container) {
+        var me = this;
+        Ext.Ajax.request({
+            url: document.URL,
+            params: {
+                id: 1
+            },
+            success: function (response) {
+                text = response.responseText;
+                if ( CHECKSUM ) {
+                    if ( CHECKSUM !== me._generateChecksum(text) ) {
+                        console.log("Checksums don't match!");
+                        if ( me.dialog ) {
+                            me.dialog.add({xtype:'container',html:'Checksums do not match'});
+                        }
+                    }
+                }
+            }
+        });
+    },
+    onClick: function(e) {
+        var me = this;
+        this._checkChecksum(this);
+        
+        var dialog_items = [];
+        
+        if ( this.informationHtml ) {
+            dialog_items.push({
+                xtype:'container',
+                html: this.informationHtml
+            });
+        }
+                
+        dialog_items.push({
+            xtype:'container',
+            html:"This app was created by the Rally Technical Services Team."
+        });
+        
+        if ( APP_BUILD_DATE ) {
+            dialog_items.push({
+                xtype:'container',
+                html:'Build date/time: ' + APP_BUILD_DATE
+            });
+        }
+        
+        if (this.dialog){this.dialog.destroy();}
+        this.dialog = Ext.create('Rally.ui.dialog.Dialog',{
+            defaults: { padding: 5, margin: 5 },
+            closable: true,
+            draggable: true,
+            title: me.title,
+            items: dialog_items
+        });
+        this.dialog.show();
+    }
+});
+
+/*
+ */
+Ext.define('Rally.technicalservices.Logger',{
+    constructor: function(config){
+        Ext.apply(this,config);
+    },
+    log: function(args){
+        var timestamp = "[ " + Ext.util.Format.date(new Date(), "Y-m-d H:i:s.u") + " ]";
+        //var output_args = arguments;
+        //output_args.unshift( [ "[ " + timestamp + " ]" ] );
+        //output_args = Ext.Array.push(output_args,arguments);
+        
+        var output_args = [];
+        output_args = Ext.Array.push(output_args,[timestamp]);
+        output_args = Ext.Array.push(output_args, Ext.Array.slice(arguments,0));
+
+        window.console && console.log.apply(console,output_args);
+    }
+
+});
+
+/*
+ * A series of utilities to help construct trees
+ * with data gotten bottom or middle-up
+ * 
+ */
+ 
+Ext.define('Rally.technicalservices.util.TreeBuilding', {
+    singleton: true,
+    logger: new Rally.technicalservices.Logger(),
+    /*
+     * Given a hash of models (key = object id) that all know what
+     * their parent is (based on the "parent" field -- note lowercase)
+     * Return an array of models that are at the root level and
+     * have a "children" field (note lowercase)
+     * with appropriate items in an array 
+     */
+    constructRootItems:function(item_hash) {
+        var root_array = [];
+        Ext.Object.each(item_hash, function(oid,item){
+            if ( !item.get('children') ) { item.set('children',[]); }
+            var direct_parent = item.get('parent');
+            if (!direct_parent && !Ext.Array.contains(root_array,item)) {
+                root_array.push(item);
+            } else {
+                
+                var parent_oid =  direct_parent.ObjectID || direct_parent.get('ObjectID');
+                if (!item_hash[parent_oid]) {
+                    this.logger.log("Saved parent missing: ", parent_oid);
+                    if ( !Ext.Array.contains(root_array,item) ) {
+                        root_array.push(item);
+                    }
+                } else {
+                    var parent = item_hash[parent_oid];
+                    if ( !parent.get('children') ) { parent.set('children',[]); }
+                    var kids = parent.get('children');
+                    kids.push(item);
+                    parent.set('children',kids);
+                }
+            }
+        },this);
+        return root_array;
+    },
+    /*
+     * Given a hash of hashes (key = object id) that all know what
+     * their parent is (based on the "parent" field -- note lowercase)
+     * Return an array of models that are at the root level and
+     * have a "children" field (note lowercase)
+     * with appropriate items in an array 
+     */
+    constructRootItemsFromHashes:function(item_hash) {
+        var root_array = [];
+
+        Ext.Object.each(item_hash, function(oid,item){
+
+            if ( !item.children ) { item.children = []; }
+            var direct_parent = item.parent;
+            if (!direct_parent && !Ext.Array.contains(root_array,item)) {
+                root_array.push(item);
+            } else {
+                if (!item_hash[direct_parent]) {
+                    this.logger.log("Saved parent missing: ", direct_parent);
+                    if ( !Ext.Array.contains(root_array,item) ) {
+                        root_array.push(item);
+                    }
+                } else {
+                    var parent = item_hash[direct_parent];
+                    if ( !parent.children ) { parent.children = []; }
+                    var kids = parent.children;
+                    kids.push(item);
+                    parent.children = kids;
+                }
+            }
+        },this);
+        return root_array;
+    },
+    /**
+     * Given an array of models, turn them into hashes
+     */
+    convertModelsToHashes: function(model_array) {
+        var hash_array = [];
+        Ext.Array.each(model_array,function(model){
+            if (this.isModel(model)) {
+                var model_as_hash = model.data;
+                model_as_hash.expanded = false;
+                model_as_hash.leaf = false;
+                
+                // children & parent are fields that are not a 
+                // part of the model def'n so getData doesn't provide them
+                if ( model.get('children') ) {
+                    model_as_hash.children = this.convertModelsToHashes(model.get('children'));
+                }
+                if ( model.get('parent') ) {
+                    if ( this.isModel(model.get('parent') ) ) {
+                        model_as_hash.parent = model.get('parent').getData();
+                    } else {
+                        model_as_hash.parent = model.get('parent');
+                    }
+                }
+
+                if (!model_as_hash.children || model_as_hash.children.length === 0 ) {
+                    model_as_hash.leaf = true;
+                }
+                
+                hash_array.push(model_as_hash);
+            } else {
+                hash_array.push(model);
+            }
+        },this);
+        return hash_array;
+    },
+    isModel: function(model){
+        return model && ( model instanceof Ext.data.Model );
+    },
+    /**
+     * Given an array of top-level models (will have field called 'children' holding more models),
+     * roll up the value in the bottom of the tree's field_name
+     * 
+     * Config object has these values:
+     * 
+     * @param [{Ext.data.model}] root_items
+     * @param {String} field_name
+     * @param {Boolean} leaves_only (true to ignore parent value, false to add children to parent's existing value)
+     * @param {String|fn} calculator [ 'count' ]
+     */
+    rollup: function(config){
+        Ext.Array.each(config.root_items,function(root_item){
+            this._setValueFromChildren(root_item,config.field_name,config.calculator,config.leaves_only);
+        },this);
+        return config.root_items;
+    },
+    _setValueFromChildren:function(parent_item,field_name,calculator,leaves_only){
+        var parent_value = parent_item.get(field_name) || 0;
+        if ( calculator ) {
+            parent_value = this._calculate(parent_item,calculator);
+        }
+        var children = parent_item.get('children') || [];
+        
+        if ( leaves_only && children.length > 0 ) { parent_value = 0; }
+
+        Ext.Array.each(children,function(child_item) {
+            this._setValueFromChildren(child_item,field_name,calculator,leaves_only);
+            var child_value = child_item.get(field_name) || 0;
+            if ( calculator && child_value == 0 ) {
+                child_value = this._calculate(child_item,calculator);
+            }
+            parent_value += child_value;
+        },this);
+        parent_item.set(field_name,parent_value);
+        return;
+    },
+    _calculate:function(item,calculator){
+        'use strict';
+        if ( calculator == 'count' ) {
+            return 1;
+        }
+        return calculator(item);
+        
+    },
+    /**
+     * Given an array of root items, find nodes in the tree where field_name contains field_value
+     * and prune them
+     * 
+     * @param {} root_items
+     * @param {} field_name
+     * @param {} field_value
+     * @return {}
+     */
+    pruneByFieldValue: function(root_items,field_name,field_value){
+        Ext.Array.each(root_items,function(root_item){
+            this._removeByFieldValue(root_items,root_item,field_name,field_value);
+        },this);
+        return root_items;
+    },
+    _removeByFieldValue: function(parent_array,parent_item,field_name,field_value){
+        var tester = new RegExp(field_value);
+        
+        if ( parent_item ) {
+            var value = parent_item.get(field_name) || "";
+            if ( tester.test(value) ) {
+                Ext.Array.remove(parent_array,parent_item);
+            } else {
+                var kids = parent_item.get('children') || [];
+                if ( kids.length > 0 ) {
+                    Ext.Array.each(kids, function(kid){
+                        this._removeByFieldValue(kids,kid,field_name,field_value);
+                    },this);
+                }
+            }
+        }
+    }
+});
+Ext.define('CustomApp', {
+    extend: 'Rally.app.App',
+    componentCls: 'app',
+    logger: new Rally.technicalservices.Logger(),
+    items: [
+       {xtype:'container',itemId:'control_box',layout: {type:'hbox'}, padding: 10},
+//       {xtype:'container',itemId:'summary_box',layout: {type:'vbox'}, 
+//                     padding: 10, 
+//                     tpl: '{Msg} % of Total Points Completed',
+//                     emptyText: '',
+//                     flex: 1},
+        {xtype:'container',itemId:'display_box'},
+        {xtype:'container',itemId:'sub_chart_box',layout: {type: 'hbox'}},
+        {xtype:'container', itemId: 'grid_box'},
+        {xtype:'tsinfolink'}
+    ],
+    /*
+     * preliminaryEstimateMap:  Hash maps PreliminaryEstimate ObjectIDs to corresponding values
+     */
+    preliminaryEstimateMap: [],
+    /*
+     * portfolioItemTypes:  Array of PortfolioItem TypePaths, in order of ordinal (LowestLevel Ordinal = 0)
+     */
+    
+    portfolioItemTypes: [],
+    /*
+     * portfolioitemStateDone: The state that defines "done" for lowest level portfolio items.  This is the state that is used to determine
+     *                         whether to use the LeafStoryPlanEstimateTotal or the PreliminaryEstimate
+     */
+    portfolioItemStateDone: 'Done',
+    portfolioItemStateName: 'State',
+    /*
+     * stateFieldValues: Field values for the ScheduleState in HierarchicalRequirements to be displayed in the chart
+     */
+    stateFieldValues: ['Defined','In-Progress','Completed','Accepted'],
+    /*
+     * selectedPortfolioItemIds: Array holds the currently selected portfolio item ids.
+     */
+    selectedPortfolioItemIds: [],
+    
+    launch: function() {
+        Ext.create('CumulativeFlowCalculator',{});
+        
+        //Initialize the PortfolioItem types and PreliminaryEstimate object ids before loading.  
+        var promises = [];
+        promises.push(this._fetchPortfolioItemTypes());
+        promises.push(this._fetchPreliminaryEstimateMap());
+        Deft.Promise.all(promises).then({
+            scope: this,
+            success: function(){
+                this._addControls();
+            }
+        });
+    },
+    _addControls: function(){
+        var min_dropdown_width = 300; 
+        var label_width = 100;
+        this.down('#control_box').add({
+            xtype: 'container',
+            layout: {type: 'vbox'},
+            items: [{
+                xtype: 'rallytagpicker',
+                itemId: 'tag-picker',
+                alwaysExpanded: false,
+                autoExpand: false, 
+                minWidth: min_dropdown_width + label_width,
+                fieldLabel: 'Tags',
+                labelWidth: label_width,
+                labelAlign: 'right',
+                storeConfig: {
+                    sorters: [{
+                        property: 'Name',
+                        direction: 'ASC'
+                    }],
+                    filters: [{
+                        property: 'Archived',
+                        value: false
+                    }]
+                },
+                listeners: {
+                    scope: this,
+                    selectionchange: this._updateTagLabel
+                },
+                _onBlur: function () {
+                    if (this.toolTip) {
+                        this.toolTip.destroy();
+                    }
+                    this.collapse();
+                }
+            },{
+                xtype: 'textarea',
+                itemId: 'tags-label',
+                width: min_dropdown_width,
+                fieldLabel: 'Match Any of the following Tags:',
+                border: false,
+                labelWidth: label_width,
+                labelAlign: 'top',
+                value: 'No Tags selected.',
+                margin: '0 0 15 105',
+                fieldStyle: {color: 'gray'},
+                hidden: true
+            }]
+       });
+        
+       this.down('#control_box').add({
+            xtype: 'container',
+            layout: {type: 'vbox'},
+            items: [{
+                xtype: 'rallytextfield',
+                itemId: 'selected-portfolio-item',
+                width: min_dropdown_width,
+                emptyText: 'Select Portfolio Item',
+                height: 25,
+                readOnly: true,
+                fieldLabel: 'Portfolio Item',
+                labelWidth: label_width,
+                width: 400,
+                labelAlign: 'right'
+            },{
+                xtype: 'rallycheckboxfield',
+                itemId: 'chk-restrict',
+                value: false,
+                boxLabel: 'Restrict to Portfolio Item Hierarchy',
+                margin: '0 0 0 110',
+            }]
+        });
+        
+       this.down('#control_box').add({ 
+           xtype: 'rallybutton',
+           text: 'Select...',
+           scope: this,
+           margin: '0 0 0 10',
+           handler: this._selectPortfolioItems
+      });
+       this.down('#control_box').add({
+           xtype: 'rallybutton',
+           text: 'Update',
+           margin: '0 0 0 20',
+           scope: this,
+           handler: this._run
+       });
+       this.down('#control_box').add({
+           xtype: 'rallybutton',
+           itemId: 'btn-show-grid',
+           text: 'Show Grid',
+           margin: '0 0 0 20',
+           scope: this,
+           disabled: true, 
+           handler: this._displayGrid
+       });
+       this.down('#control_box').add({
+           xtype: 'rallybutton',
+           itemId: 'btn-drill-down',
+           text: 'Drill Down',
+           margin: '0 0 0 20',
+           scope: this,
+           disabled: true,
+           handler: this._drillDown
+       });
+       
+    },
+    _updateQuerySummary: function(data){
+        this.down('#query-summary').update(data);
+    },
+    _fetchPortfolioItemTypes: function(){
+        var deferred = Ext.create('Deft.Deferred');
+        
+        Ext.create('Rally.data.wsapi.Store',{
+            model: 'TypeDefinition',
+            fetch: ['TypePath','Ordinal'],
+            autoLoad: true, 
+            filters: [{
+                property: 'TypePath',
+                operator: 'contains',
+                value: 'PortfolioItem/'
+            }],
+            listeners: {
+                scope: this,
+                load: function(store, data, success){
+                    this.portfolioItemTypes = new Array(data.length);
+                    Ext.each(data, function(d){
+                        //Use ordinal to make sure the lowest level portfolio item type is the first in the array.  
+                        var idx = Number(d.get('Ordinal'));
+                        this.portfolioItemTypes[idx] = d.get('TypePath');
+                    }, this);
+                    deferred.resolve(); 
+                }
+            }
+        });
+        return deferred.promise; 
+    },
+    _fetchPreliminaryEstimateMap: function(){
+        var deferred = Ext.create('Deft.Deferred');
+        Ext.create('Rally.data.wsapi.Store',{
+            model: 'PreliminaryEstimate',
+            fetch: ['ObjectID','Name','Value'],
+            autoLoad: true, 
+            listeners: {
+                scope: this,
+                load: function(store, data, success){
+                    this.preliminaryEstimateMap = {};
+                    Ext.each(data, function(d){
+                        this.preliminaryEstimateMap[d.get('ObjectID')] = d.get('Value');
+                    }, this);
+                    deferred.resolve(); 
+                }
+            }
+        });
+        return deferred.promise; 
+    },
+    _selectPortfolioItems: function(){
+        
+        Ext.create('Rally.ui.dialog.SolrArtifactChooserDialog', {
+            artifactTypes: ['portfolioitem'],
+            autoShow: true,
+            height: 400,
+            resizable: true,
+            title: 'Choose Portfolio Items',
+            storeConfig: {
+                fetch: ['FormattedID','Name','ObjectID','PlannedEndDate','PlannedStartDate'],
+                pageSize: 200
+            },
+            listeners: {
+                artifactchosen: function(ac, selectedRecord){
+                    this.selectedPortfolioItemRecord = selectedRecord;
+                    this.down('#selected-portfolio-item').setValue(selectedRecord.get('FormattedID') + ':' + selectedRecord.get('Name'));
+                },
+                scope: this
+            }
+         });
+    },
+   /*
+    * _validate: Validates that we have the start and planned end dates for the chart and also that the chart has at least a tag or a 
+    *            PortfolioItem hierarchy restriction. 
+    */
+    _validate: function(){
+        if (this._getStartDate() == null || this._getEndDate() == null){
+            alert('Please select a PortfolioItem with a PlannedStartDate and PlannedEndDate.');
+            return false;  
+        }
+        if (this._getTagObjectIDs().length ==0){
+            if (!this._isPortfolioItemRestricted()){
+                alert('Please select at least 1 tag or restrict the PortfolioItem hierarchy to the selected PortfolioItem.');
+                return false; 
+            }
+        }
+        return true; 
+    },
+    _isPortfolioItemRestricted: function(){
+        return this.down('#chk-restrict').getValue();
+    },
+    _getPortfolioItemIDs: function(){
+        var pids = [];  
+        if (this._isPortfolioItemRestricted()){
+            pids.push(this.selectedPortfolioItemRecord.get('ObjectID'));
+        }
+        return pids;  
+    },
+    _getLowestLevelPortfolioItemType: function(){
+        return this.portfolioItemTypes[0];
+    },
+    _getStartDate: function(){
+        return this._getDate('PlannedStartDate');
+    },
+    _getEndDate: function(){
+        return this._getDate('PlannedEndDate');
+    },
+    _getDate: function(field){
+        this.logger.log('_getDate',field, this.selectedPortfolioItemRecord);
+        if (this.selectedPortfolioItemRecord){
+            var d = this.selectedPortfolioItemRecord.get(field);
+            if (d){
+                return new Date(d);
+            }
+        }
+        return null;
+    },
+    _run: function(){
+        this.logger.log('_run');
+        
+        if (!this._validate()){
+            return; 
+        }
+
+        if (this.down('#tree-grid')){
+            this.down('#tree-grid').destroy();
+        }
+        this.down('#sub_chart_box').removeAll();
+        
+        var tags = this._getTagObjectIDs(); 
+        var pids = this._getPortfolioItemIDs();
+        var container_id = 'display_box';
+        var chart_id = 'rally-chart';
+        var project_id = this.getContext().getProject().ObjectID;
+        var project_name = this.getContext().getProject().Name;
+        
+        this._fetchPortfolioItemData(tags, pids).then({
+            scope:this,
+            success: function(data){
+                this.logger.log('_run Success', data);
+                if (tags.length > 0){
+                    this._getInheritedPortfolioItemIds(data).then({
+                        scope: this,
+                        success: function(data){
+                            this.logger.log('_getInheritedPortfolioItemIds Success', data);
+                            this.portfolioItemIds = this._getPortfolioItemIds(data);
+                            this._createChart(this.portfolioItemIds,project_id, project_name, container_id, chart_id);
+                        },
+                        failure: function(error){
+                            alert(error);
+                        }
+                    });
+                } else {
+                    this.portfolioItemIds = this._getPortfolioItemIds(data);
+                    this._createChart(this.portfolioItemIds,project_id, project_name, container_id, chart_id);
+                }
+                
+            },
+            failure: function(error, success){
+                alert(error);
+            }
+        });
+    },
+    _getInheritedPortfolioItemIds: function(data){
+        var deferred = Ext.create('Deft.Deferred');
+        var pids = []; 
+        
+        Ext.each(data, function(d){
+            pids.push(d.get('ObjectID'));
+        }, this);
+        
+        this._fetchPortfolioItemData([], pids).then({
+            scope: this,
+            success: function(data){
+                deferred.resolve(data);
+            },
+            failure: function(error){
+                deferred.reject('_getInheritedPortfolioItemIds: ' + error);
+            }
+        });
+        return deferred; 
+    },
+    _getPortfolioItemIds: function(data, tags){
+        //Now parse through the data to get the portfolio item object ids that we want
+        var pids = [];
+        
+        Ext.each(data, function(d){
+            var pi_type = d.get('_TypeHierarchy').slice(-1)[0];
+            if (pi_type == this._getLowestLevelPortfolioItemType()){
+                pids.push(d.get('ObjectID'));
+            }
+         },this);
+         return pids;
+    },
+    _createChart: function(portfolioItemIds, projectID, projectName, containerID, chartID, chartHeight){
+        this.logger.log('_createChart',portfolioItemIds, this._getStartDate(),this._getEndDate());
+        if (chartHeight == undefined){
+            chartHeight = 600;
+        }
+        var startDate = this._getStartDate();
+        var endDate = this._getEndDate(); 
+        var lowest_pi = this._getLowestLevelPortfolioItemType();
+        var pi_state_name = this.portfolioItemStateName;
+        var pi_state_done = this.portfolioItemStateDone;
+        
+        if (this.down('#' + chartID)){
+            this.down('#' + chartID).destroy();
+        }
+        
+        this.down('#' + containerID).add({
+            xtype: 'rallychart',
+            itemId: chartID,
+            height: chartHeight,
+            calculatorType: 'CumulativeFlowCalculator',
+            storeType: 'Rally.data.lookback.SnapshotStore',
+            storeConfig: this._getStoreConfig(portfolioItemIds, projectID),
+            calculatorConfig: {
+                stateFieldName: 'ScheduleState',
+                stateFieldValues: this.stateFieldValues,
+                startDate: startDate,
+                endDate: endDate,
+                lowestLevelPortfolioItemType: lowest_pi,
+                portfolioItemStateDone: pi_state_done,
+                portfolioItemStateName: pi_state_name,
+                preliminaryEstimateMap: this.preliminaryEstimateMap
+            },
+            queryErrorMessage: 'No data was found for ' + projectName + ' based on the current chart settings.',
+            chartConfig: this._getChartConfig(projectName, chartHeight),
+            listeners: {
+                scope: this,
+                readyToRender: function(chart){
+                    chart.chartConfig.subtitle.text = chart.calculator.getPercentCompleted(); 
+                    this.down('#btn-show-grid').setDisabled(false);
+                    this.down('#btn-drill-down').setDisabled(false);
+                 //   deferred.resolve();
+                },
+                afterrender: function(chart){
+                    //deferred.resolve();
+                }
+            }
+        });
+        //return deferred;  
+    },
+
+    _getChartConfig: function(projectName, chartHeight){
+        
+        return {
+            chart: {
+                zoomType: 'xy',
+                height: chartHeight,
+                //width: '90%'
+            },
+            height: chartHeight,
+            width: '90%',
+            title: {
+                text: projectName + ' Cumulative Flow by Tags'
+            },
+            subtitle: {
+                text: ''
+            },
+            xAxis: {
+                tickmarkPlacement: 'on',
+                tickInterval: 7,
+            },
+            yAxis: [
+                {
+                    title: {
+                        text: 'Points'
+                    }
+                }
+            ],
+            plotOptions: {
+                series: {
+                    marker: { enabled: false },
+                    stacking: 'normal'
+                },
+                line: {
+                    connectNulls: true,
+                    stacking: 'null'
+                }
+            }
+        };
+        
+    },
+    
+    _fetchPortfolioItemData: function(tags, pids){
+        this.logger.log('_fetchPortfolioItemData', tags, pids);
+        var deferred = Ext.create('Deft.Deferred');
+        var portfolio_item_ids = [];
+        var top_level_pis = [];
+        var find_obj = {
+                _TypeHierarchy: {$in: this.portfolioItemTypes},
+                __At: "current",
+                _ProjectHierarchy: this.getContext().getProject().ObjectID
+            };
+        if (tags.length > 0) {
+            find_obj.Tags = {$in: tags};
+        }
+        if (pids.length > 0) {
+            find_obj._ItemHierarchy = {$in: pids};
+        }
+        
+        Ext.create('Rally.data.lookback.SnapshotStore', {
+            listeners: {
+                scope: this,
+                load: function(store, data, success) {
+                    if (success) {
+                        deferred.resolve(data);
+                    } else {
+                        deferred.reject('Error getting associated Portfolio Items', success);
+                    }
+                }
+            },
+            autoLoad: true,
+            fetch: ['ObjectID', 'FormattedID','Name','_ItemHierarchy','_TypeHierarchy','LeafStoryPlanEstimateTotal','PreliminaryEstimate','PlannedStartDate','PlannedEndDate','State'],
+            hydrate: ['State','PreliminaryEstimate','_TypeHierarchy'],
+            find: find_obj
+        });
+        return deferred; 
+    },
+
+    _getTagObjectIDs: function(){
+        var tag_objects = this.down('#tag-picker').getValue(); 
+        var tags = [];
+        Ext.each(tag_objects, function(to){
+            tags.push(to.get('ObjectID'));
+        },this);
+        return tags; 
+    },
+    
+    _getStoreConfig: function(portfolioItemObjectIds, projectID){
+        this.logger.log('_getStoreConfig', portfolioItemObjectIds);
+        var lowest_pi = this._getLowestLevelPortfolioItemType();
+        return {
+            find: {
+                _TypeHierarchy: {$in: ['HierarchicalRequirement', lowest_pi]},
+                Children: null,
+                _ProjectHierarchy: projectID, 
+                _ItemHierarchy: {$in: portfolioItemObjectIds}
+             },
+            fetch: ['FormattedID','Name','ScheduleState','PlanEstimate','Parent','_TypeHierarchy','_ValidTo','_ValidFrom','PreliminaryEstimate','State','LeafStoryPlanEstimateTotal','PortfolioItem','AcceptedLeafStoryPlanEstimateTotal','_ItemHierarchy'],
+            hydrate: ['ScheduleState','_TypeHierarchy','State'],
+            compress: true,
+            sort: {
+                _ValidFrom: 1
+            },
+            context: this.getContext().getDataContext(),
+            limit: Infinity
+        };
+    },
+    
+    _updateTagLabel: function(picker, values, evt){
+        var tag_text = ''
+        Ext.each(values, function(v){
+            tag_text += v.get('Name') + ', ';
+        },this);
+        tag_text = tag_text.replace(/(, $)/, "")
+        if (tag_text.length > 0){
+            this.down('#tags-label').show();
+            this.down('#tags-label').setValue(tag_text); 
+        } else {
+            this.down('#tags-label').hide();
+        }
+    },
+    _getTreeColumns: function(tree_data_hash){
+        this.logger.log('_getTreeColumns');
+        var unwanted_keys = ['ObjectID','FormattedID','Name'];
+        var columns = [{
+            xtype: 'treecolumn',
+            text: 'FormattedID',
+            dataIndex: 'ObjectID',
+            renderer: function(v,m,r){
+                return r.get('FormattedID');
+            }
+        },{
+                text: 'Name',
+                dataIndex: 'Name',
+                flex: 1
+        },{
+            text: 'PlanEstimate',
+            dataIndex: 'PlanEstimate',
+        },{
+            text: 'Accepted PlanEstimate',
+            dataIndex: 'AcceptedPlanEstimate'
+        },{
+            text: 'State',
+            dataIndex: 'State',
+        },{
+            text: 'Preliminary Estimate',
+            dataIndex: 'PreliminaryEstimate',
+        }];
+
+        return columns;        
+    },
+    _displayGrid: function(){
+        this.logger.log('_displayGrid');
+        var chart = this.down('#rally-chart');
+        
+        var tree_store_hash = Rally.technicalservices.util.TreeBuilding.constructRootItemsFromHashes(chart.calculator.gridStoreData.data);
+        var fields = Object.keys(tree_store_hash[0]);
+
+         Ext.define('TSTreeModel', {
+                extend: 'Ext.data.Model',
+                fields: fields
+            });
+            
+            var tree_store = Ext.create('Ext.data.TreeStore',{
+                model: TSTreeModel,
+                root: {
+                    expanded: false,
+                    children: tree_store_hash
+                }
+            });
+
+        
+        this.down('#grid_box').add({
+            xtype: 'treepanel',
+            width: "90%",
+            itemId: 'tree-grid',
+            store: tree_store,
+            cls: 'rally-grid',
+            rootVisible: false,
+           columns: this._getTreeColumns(tree_store_hash)
+        });
+    },
+    _drillDown: function(){
+       //Get child projects
+       this.logger.log('_drillDown');
+       
+       Ext.create('Rally.data.wsapi.Store',{
+               model: 'Project',
+               autoLoad: true,
+               filters: {
+                   property: 'Parent',
+                   value: this.getContext().getProjectRef()
+               },
+               listeners: {
+                   scope: this, 
+                   load: function(store, data, success) {
+                       this.logger.log(data);
+                       this._renderSubCharts(data);
+                   }
+               },
+               fetch: ['ObjectID', 'Name']
+       }); 
+    },
+    _renderSubCharts: function(project_records){
+        this.down('#sub_chart_box').removeAll();
+        this.down('#sub_chart_box').add({
+            xtype: 'container',
+            itemId: 'sub-chart-left',
+            layout: {type: 'vbox'},
+            width: '50%',
+            padding: 10
+        });
+        this.down('#sub_chart_box').add({
+            xtype: 'container',
+            itemId: 'sub-chart-right',
+            layout: {type: 'vbox'},
+            padding: 10,
+            width: '50%'
+                
+        });
+        var me = this;
+        var pids = this.portfolioItemIds;
+        var container_id = 'sub-chart-left';
+        var chart_height = 300;
+        var promises = [];  
+        Ext.each(project_records, function(d){
+            var obj_id = d.get('ObjectID');
+            var chart_container_id = obj_id + '-box';
+            var chart_id = obj_id + '-chart';
+            this.down('#' + container_id).add({
+                xtype: 'container',
+                itemId: chart_container_id,
+                width: '100%',
+                height: chart_height,
+                margin: 25
+            });
+           this._createChart(pids, obj_id, d.get('Name'), chart_container_id, chart_id,chart_height);
+            if (container_id == 'sub-chart-left'){
+                container_id = 'sub-chart-right';
+            } else {
+                container_id = 'sub-chart-left';
+            }
+        },this);
+
+    }
+});
+            
+               Rally.launchApp('CustomApp', {
+                   name: 'Cumulative Flow by Tags'
+               });
+        });
+    </script>
+    
+    <style type="text/css">
+
+.app {
+}
+.tsinfolink {
+    position:absolute;
+    right:0px;
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    text-align: center;
+    color: white;
+    background: #C0C0C0;
+    border-style: solid;
+    border-width: 1px;
+    margin-top: 25px;
+    margin-right: 5px;
+    cursor: pointer;
+}
+    </style>
+
+</head>
+<body></body>
+</html>
